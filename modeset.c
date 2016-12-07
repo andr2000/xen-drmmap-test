@@ -40,16 +40,18 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+#include "xen-drm-map.h"
+
 struct modeset_dev;
 static int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn,
 			     struct modeset_dev *dev);
-static int modeset_create_fb(int fd, struct modeset_dev *dev);
-static int modeset_setup_dev(int fd, drmModeRes *res, drmModeConnector *conn,
+static int modeset_create_fb(int fd, int fd_map, struct modeset_dev *dev);
+static int modeset_setup_dev(int fd, int fd_map, drmModeRes *res, drmModeConnector *conn,
 			     struct modeset_dev *dev);
 static int modeset_open(int *out, const char *node);
-static int modeset_prepare(int fd);
+static int modeset_prepare(int fd, int fd_map);
 static void modeset_draw(void);
-static void modeset_cleanup(int fd);
+static void modeset_cleanup(int fd, int fd_map);
 
 /*
  * When the linux kernel detects a graphics-card on your machine, it loads the
@@ -183,7 +185,7 @@ static struct modeset_dev *modeset_list = NULL;
  * unused and no monitor is plugged in. So we can ignore this connector.
  */
 
-static int modeset_prepare(int fd)
+static int modeset_prepare(int fd, int fd_map)
 {
 	drmModeRes *res;
 	drmModeConnector *conn;
@@ -215,7 +217,7 @@ static int modeset_prepare(int fd)
 		dev->conn = conn->connector_id;
 
 		/* call helper function to prepare this connector */
-		ret = modeset_setup_dev(fd, res, conn, dev);
+		ret = modeset_setup_dev(fd, fd_map, res, conn, dev);
 		if (ret) {
 			if (ret != -ENOENT) {
 				errno = -ret;
@@ -267,7 +269,7 @@ static int modeset_prepare(int fd)
  *     framebuffer onto the monitor.
  */
 
-static int modeset_setup_dev(int fd, drmModeRes *res, drmModeConnector *conn,
+static int modeset_setup_dev(int fd, int fd_map, drmModeRes *res, drmModeConnector *conn,
 			     struct modeset_dev *dev)
 {
 	int ret;
@@ -302,7 +304,7 @@ static int modeset_setup_dev(int fd, drmModeRes *res, drmModeConnector *conn,
 	}
 
 	/* create a framebuffer for this CRTC */
-	ret = modeset_create_fb(fd, dev);
+	ret = modeset_create_fb(fd, fd_map, dev);
 	if (ret) {
 		fprintf(stderr, "cannot create framebuffer for connector %u\n",
 			conn->connector_id);
@@ -411,6 +413,48 @@ static int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn,
 	return -ENOENT;
 }
 
+int xendrmmap_map(int fd, int fd_map, struct drm_mode_create_dumb *dumb)
+{
+	struct xendrmmap_ioctl_map info;
+	struct drm_prime_handle prime;
+	int ret;
+
+	prime.handle = dumb->handle;
+	prime.flags = DRM_CLOEXEC;
+	ret = drmIoctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime);
+
+	if (ret < 0) {
+		fprintf(stderr, "cannot get fd for handle %d, ret %d\n",
+			prime.handle, ret);
+		return -EINVAL;
+	}
+	fprintf(stdout, "got fd %u for prime handle %u\n",
+		prime.fd, prime.handle);
+	info.fd = prime.fd;
+	ret = drmIoctl(fd_map, DRM_IOCTL_XENDRM_MAP, &info);
+	if (ret < 0) {
+		fprintf(stderr, "cannot set handle to Xen driver %d\n", ret);
+		return -EINVAL;
+	}
+	fprintf(stdout, "set fd to Xen driver %u\n", prime.fd);
+	return 0;
+}
+
+int xendrmmap_unmap(int fd_map)
+{
+	struct xendrmmap_ioctl_unmap info;
+	int ret;
+
+	info.fd = fd_map;
+	ret = drmIoctl(fd_map, DRM_IOCTL_XENDRM_UNMAP, &info);
+	if (ret < 0) {
+		fprintf(stderr, "cannot set fd %d to Xen driver %d\n", fd_map, ret);
+		return -EINVAL;
+	}
+	fprintf(stdout, "set fd to Xen driver %u\n", fd_map);
+	return 0;
+}
+
 /*
  * modeset_create_fb(fd, dev): After we have found a crtc+connector+mode
  * combination, we need to actually create a suitable framebuffer that we can
@@ -436,7 +480,7 @@ static int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn,
  * memory directly via the dev->map memory map.
  */
 
-static int modeset_create_fb(int fd, struct modeset_dev *dev)
+static int modeset_create_fb(int fd, int fd_map, struct modeset_dev *dev)
 {
 	struct drm_mode_create_dumb creq;
 	struct drm_mode_destroy_dumb dreq;
@@ -454,6 +498,8 @@ static int modeset_create_fb(int fd, struct modeset_dev *dev)
 			errno);
 		return -errno;
 	}
+	ret = xendrmmap_map(fd, fd_map, &creq);
+
 	dev->stride = creq.pitch;
 	dev->size = creq.size;
 	dev->handle = creq.handle;
@@ -478,7 +524,6 @@ static int modeset_create_fb(int fd, struct modeset_dev *dev)
 		ret = -errno;
 		goto err_fb;
 	}
-
 	/* perform actual memory mapping */
 	dev->map = mmap(0, dev->size, PROT_READ | PROT_WRITE, MAP_SHARED,
 		        fd, mreq.offset);
@@ -489,8 +534,10 @@ static int modeset_create_fb(int fd, struct modeset_dev *dev)
 		goto err_fb;
 	}
 
+#if 0
 	/* clear the framebuffer to 0 */
 	memset(dev->map, 0, dev->size);
+#endif
 
 	return 0;
 
@@ -540,7 +587,7 @@ err_destroy:
 
 int main(int argc, char **argv)
 {
-	int ret, fd;
+	int ret, fd, fd_map;
 	const char *card;
 	struct modeset_dev *iter;
 
@@ -552,13 +599,21 @@ int main(int argc, char **argv)
 
 	fprintf(stderr, "using card '%s'\n", card);
 
+	/* open the Xen DRM mapper device */
+	fd_map = drmOpen(XENDRMMAP_DRIVER_NAME, NULL);
+	if (fd_map < 0) {
+		fprintf(stderr, "cannot find " XENDRMMAP_DRIVER_NAME "\n");
+		goto out_return;
+	}
+	fprintf(stdout, "Found " XENDRMMAP_DRIVER_NAME "\n");
+
 	/* open the DRM device */
 	ret = modeset_open(&fd, card);
 	if (ret)
 		goto out_return;
 
 	/* prepare all connectors and CRTCs */
-	ret = modeset_prepare(fd);
+	ret = modeset_prepare(fd, fd_map);
 	if (ret)
 		goto out_close;
 
@@ -573,10 +628,14 @@ int main(int argc, char **argv)
 	}
 
 	/* draw some colors for 5seconds */
+#if 0
 	modeset_draw();
+#else
+	usleep(10000000);
+#endif
 
 	/* cleanup everything */
-	modeset_cleanup(fd);
+	modeset_cleanup(fd, fd_map);
 
 	ret = 0;
 
@@ -669,7 +728,7 @@ static void modeset_draw(void)
  * It should be pretty obvious how all of this works.
  */
 
-static void modeset_cleanup(int fd)
+static void modeset_cleanup(int fd, int fd_map)
 {
 	struct modeset_dev *iter;
 	struct drm_mode_destroy_dumb dreq;
@@ -699,6 +758,9 @@ static void modeset_cleanup(int fd)
 		/* delete dumb buffer */
 		memset(&dreq, 0, sizeof(dreq));
 		dreq.handle = iter->handle;
+
+		xendrmmap_unmap(fd_map);
+
 		drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
 
 		/* free allocated memory */
