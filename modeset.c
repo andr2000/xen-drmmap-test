@@ -45,13 +45,15 @@
 struct modeset_dev;
 static int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn,
 			     struct modeset_dev *dev);
-static int modeset_create_fb(int fd, int fd_map, int *fd_dumb, struct modeset_dev *dev);
-static int modeset_setup_dev(int fd, int fd_map, int *fd_dumb, drmModeRes *res, drmModeConnector *conn,
-			     struct modeset_dev *dev);
+static int modeset_create_fb(int fd, int fd_map, int *fd_dumb,
+	uint32_t *dumb_handle, struct modeset_dev *dev);
+static int modeset_setup_dev(int fd, int fd_map, int *fd_dumb,
+	uint32_t *dumb_handle, drmModeRes *res, drmModeConnector *conn,
+	struct modeset_dev *dev);
 static int modeset_open(int *out, const char *node);
-static int modeset_prepare(int fd, int fd_map, int *fd_dumb);
+static int modeset_prepare(int fd, int fd_map, int *fd_dumb, uint32_t *dumb_handle);
 static void modeset_draw(void);
-static void modeset_cleanup(int fd, int fd_map, int fd_dumb);
+static void modeset_cleanup(int fd, int fd_map, int fd_dumb, uint32_t dumb_handle);
 
 /*
  * When the linux kernel detects a graphics-card on your machine, it loads the
@@ -185,7 +187,7 @@ static struct modeset_dev *modeset_list = NULL;
  * unused and no monitor is plugged in. So we can ignore this connector.
  */
 
-static int modeset_prepare(int fd, int fd_map, int *fd_dumb)
+static int modeset_prepare(int fd, int fd_map, int *fd_dumb, uint32_t *dumb_handle)
 {
 	drmModeRes *res;
 	drmModeConnector *conn;
@@ -217,7 +219,7 @@ static int modeset_prepare(int fd, int fd_map, int *fd_dumb)
 		dev->conn = conn->connector_id;
 
 		/* call helper function to prepare this connector */
-		ret = modeset_setup_dev(fd, fd_map, fd_dumb, res, conn, dev);
+		ret = modeset_setup_dev(fd, fd_map, fd_dumb, dumb_handle, res, conn, dev);
 		if (ret) {
 			if (ret != -ENOENT) {
 				errno = -ret;
@@ -269,7 +271,8 @@ static int modeset_prepare(int fd, int fd_map, int *fd_dumb)
  *     framebuffer onto the monitor.
  */
 
-static int modeset_setup_dev(int fd, int fd_map, int *fd_dumb, drmModeRes *res, drmModeConnector *conn,
+static int modeset_setup_dev(int fd, int fd_map, int *fd_dumb,
+		uint32_t *dumb_handle, drmModeRes *res, drmModeConnector *conn,
 			     struct modeset_dev *dev)
 {
 	int ret;
@@ -304,7 +307,7 @@ static int modeset_setup_dev(int fd, int fd_map, int *fd_dumb, drmModeRes *res, 
 	}
 
 	/* create a framebuffer for this CRTC */
-	ret = modeset_create_fb(fd, fd_map, fd_dumb, dev);
+	ret = modeset_create_fb(fd, fd_map, fd_dumb, dumb_handle, dev);
 	if (ret) {
 		fprintf(stderr, "cannot create framebuffer for connector %u\n",
 			conn->connector_id);
@@ -413,7 +416,8 @@ static int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn,
 	return -ENOENT;
 }
 
-int xendrmmap_map(int fd, int fd_map, int *fd_dumb, struct drm_mode_create_dumb *dumb)
+int xendrmmap_map(int fd, int fd_map, int *fd_dumb, uint32_t *dumb_handle,
+	struct drm_mode_create_dumb *dumb)
 {
 	struct xendrmmap_ioctl_map info;
 	struct drm_prime_handle prime;
@@ -430,29 +434,38 @@ int xendrmmap_map(int fd, int fd_map, int *fd_dumb, struct drm_mode_create_dumb 
 	}
 	fprintf(stdout, "got fd %u for prime handle %u\n",
 		prime.fd, prime.handle);
-	info.fd = prime.fd;
+	prime.flags = DRM_CLOEXEC;
+	ret = drmIoctl(fd_map, DRM_IOCTL_PRIME_FD_TO_HANDLE, &prime);
+	if (ret < 0) {
+		fprintf(stderr, "cannot get handle from Xen driver %d\n", ret);
+		return -EINVAL;
+	}
+	*dumb_handle = prime.handle;
+	fprintf(stdout, "get handle from Xen driver %x\n", prime.handle);
+	info.handle = prime.handle;
 	*fd_dumb = prime.fd;
 	ret = drmIoctl(fd_map, DRM_IOCTL_XENDRM_MAP, &info);
 	if (ret < 0) {
-		fprintf(stderr, "cannot set handle to Xen driver %d\n", ret);
+		fprintf(stderr, "cannot set map info to Xen driver %d\n", ret);
 		return -EINVAL;
 	}
-	fprintf(stdout, "set fd to Xen driver %u\n", prime.fd);
+	fprintf(stdout, "set mapping info to Xen driver handle %u\n", prime.handle);
 	return 0;
 }
 
-int xendrmmap_unmap(int fd_map, int fd_dumb)
+int xendrmmap_unmap(int fd, int fd_map, int fd_dumb, uint32_t dumb_handle)
 {
-	struct xendrmmap_ioctl_unmap info;
+	struct drm_gem_close args;
 	int ret;
 
-	info.fd = fd_dumb;
-	ret = drmIoctl(fd_map, DRM_IOCTL_XENDRM_UNMAP, &info);
+	args.handle = dumb_handle;
+	ret = drmIoctl(fd_map, DRM_IOCTL_GEM_CLOSE, &args);
 	if (ret < 0) {
-		fprintf(stderr, "cannot set fd %d to Xen driver %d\n", fd_map, ret);
+		fprintf(stderr, "cannot close GEM handle %x, ret %d\n",
+			dumb_handle, ret);
 		return -EINVAL;
 	}
-	fprintf(stdout, "set fd to Xen driver %u\n", fd_map);
+	fprintf(stdout, "closed handle %x\n", dumb_handle);
 	return 0;
 }
 
@@ -481,7 +494,8 @@ int xendrmmap_unmap(int fd_map, int fd_dumb)
  * memory directly via the dev->map memory map.
  */
 
-static int modeset_create_fb(int fd, int fd_map, int *fd_dumb, struct modeset_dev *dev)
+static int modeset_create_fb(int fd, int fd_map, int *fd_dumb,
+	uint32_t *dumb_handle, struct modeset_dev *dev)
 {
 	struct drm_mode_create_dumb creq;
 	struct drm_mode_destroy_dumb dreq;
@@ -499,7 +513,7 @@ static int modeset_create_fb(int fd, int fd_map, int *fd_dumb, struct modeset_de
 			errno);
 		return -errno;
 	}
-	ret = xendrmmap_map(fd, fd_map, fd_dumb, &creq);
+	ret = xendrmmap_map(fd, fd_map, fd_dumb, dumb_handle, &creq);
 
 	dev->stride = creq.pitch;
 	dev->size = creq.size;
@@ -588,7 +602,7 @@ err_destroy:
 
 int main(int argc, char **argv)
 {
-	int ret, fd, fd_map, fd_dumb;
+	int ret, fd, fd_map, fd_dumb, dumb_handle;
 	const char *card;
 	struct modeset_dev *iter;
 
@@ -614,7 +628,7 @@ int main(int argc, char **argv)
 		goto out_return;
 
 	/* prepare all connectors and CRTCs */
-	ret = modeset_prepare(fd, fd_map, &fd_dumb);
+	ret = modeset_prepare(fd, fd_map, &fd_dumb, &dumb_handle);
 	if (ret)
 		goto out_close;
 
@@ -632,11 +646,11 @@ int main(int argc, char **argv)
 #if 0
 	modeset_draw();
 #else
-	usleep(10000000);
+	usleep(20000000);
 #endif
 
 	/* cleanup everything */
-	modeset_cleanup(fd, fd_map, fd_dumb);
+	modeset_cleanup(fd, fd_map, fd_dumb, dumb_handle);
 
 	ret = 0;
 
@@ -729,7 +743,7 @@ static void modeset_draw(void)
  * It should be pretty obvious how all of this works.
  */
 
-static void modeset_cleanup(int fd, int fd_map, int fd_dumb)
+static void modeset_cleanup(int fd, int fd_map, int fd_dumb, uint32_t dumb_handle)
 {
 	struct modeset_dev *iter;
 	struct drm_mode_destroy_dumb dreq;
@@ -760,7 +774,7 @@ static void modeset_cleanup(int fd, int fd_map, int fd_dumb)
 		memset(&dreq, 0, sizeof(dreq));
 		dreq.handle = iter->handle;
 
-		xendrmmap_unmap(fd_map, fd_dumb);
+		xendrmmap_unmap(fd, fd_map, fd_dumb, dumb_handle);
 
 		drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
 
