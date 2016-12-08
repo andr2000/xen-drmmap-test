@@ -45,13 +45,13 @@
 struct modeset_dev;
 static int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn,
 			     struct modeset_dev *dev);
-static int modeset_create_fb(int fd, int fd_map, struct modeset_dev *dev);
-static int modeset_setup_dev(int fd, int fd_map, drmModeRes *res, drmModeConnector *conn,
+static int modeset_create_fb(int fd, int fd_map, int *fd_dumb, struct modeset_dev *dev);
+static int modeset_setup_dev(int fd, int fd_map, int *fd_dumb, drmModeRes *res, drmModeConnector *conn,
 			     struct modeset_dev *dev);
 static int modeset_open(int *out, const char *node);
-static int modeset_prepare(int fd, int fd_map);
+static int modeset_prepare(int fd, int fd_map, int *fd_dumb);
 static void modeset_draw(void);
-static void modeset_cleanup(int fd, int fd_map);
+static void modeset_cleanup(int fd, int fd_map, int fd_dumb);
 
 /*
  * When the linux kernel detects a graphics-card on your machine, it loads the
@@ -185,7 +185,7 @@ static struct modeset_dev *modeset_list = NULL;
  * unused and no monitor is plugged in. So we can ignore this connector.
  */
 
-static int modeset_prepare(int fd, int fd_map)
+static int modeset_prepare(int fd, int fd_map, int *fd_dumb)
 {
 	drmModeRes *res;
 	drmModeConnector *conn;
@@ -217,7 +217,7 @@ static int modeset_prepare(int fd, int fd_map)
 		dev->conn = conn->connector_id;
 
 		/* call helper function to prepare this connector */
-		ret = modeset_setup_dev(fd, fd_map, res, conn, dev);
+		ret = modeset_setup_dev(fd, fd_map, fd_dumb, res, conn, dev);
 		if (ret) {
 			if (ret != -ENOENT) {
 				errno = -ret;
@@ -269,7 +269,7 @@ static int modeset_prepare(int fd, int fd_map)
  *     framebuffer onto the monitor.
  */
 
-static int modeset_setup_dev(int fd, int fd_map, drmModeRes *res, drmModeConnector *conn,
+static int modeset_setup_dev(int fd, int fd_map, int *fd_dumb, drmModeRes *res, drmModeConnector *conn,
 			     struct modeset_dev *dev)
 {
 	int ret;
@@ -304,7 +304,7 @@ static int modeset_setup_dev(int fd, int fd_map, drmModeRes *res, drmModeConnect
 	}
 
 	/* create a framebuffer for this CRTC */
-	ret = modeset_create_fb(fd, fd_map, dev);
+	ret = modeset_create_fb(fd, fd_map, fd_dumb, dev);
 	if (ret) {
 		fprintf(stderr, "cannot create framebuffer for connector %u\n",
 			conn->connector_id);
@@ -413,7 +413,7 @@ static int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn,
 	return -ENOENT;
 }
 
-int xendrmmap_map(int fd, int fd_map, struct drm_mode_create_dumb *dumb)
+int xendrmmap_map(int fd, int fd_map, int *fd_dumb, struct drm_mode_create_dumb *dumb)
 {
 	struct xendrmmap_ioctl_map info;
 	struct drm_prime_handle prime;
@@ -431,6 +431,7 @@ int xendrmmap_map(int fd, int fd_map, struct drm_mode_create_dumb *dumb)
 	fprintf(stdout, "got fd %u for prime handle %u\n",
 		prime.fd, prime.handle);
 	info.fd = prime.fd;
+	*fd_dumb = prime.fd;
 	ret = drmIoctl(fd_map, DRM_IOCTL_XENDRM_MAP, &info);
 	if (ret < 0) {
 		fprintf(stderr, "cannot set handle to Xen driver %d\n", ret);
@@ -440,12 +441,12 @@ int xendrmmap_map(int fd, int fd_map, struct drm_mode_create_dumb *dumb)
 	return 0;
 }
 
-int xendrmmap_unmap(int fd_map)
+int xendrmmap_unmap(int fd_map, int fd_dumb)
 {
 	struct xendrmmap_ioctl_unmap info;
 	int ret;
 
-	info.fd = fd_map;
+	info.fd = fd_dumb;
 	ret = drmIoctl(fd_map, DRM_IOCTL_XENDRM_UNMAP, &info);
 	if (ret < 0) {
 		fprintf(stderr, "cannot set fd %d to Xen driver %d\n", fd_map, ret);
@@ -480,7 +481,7 @@ int xendrmmap_unmap(int fd_map)
  * memory directly via the dev->map memory map.
  */
 
-static int modeset_create_fb(int fd, int fd_map, struct modeset_dev *dev)
+static int modeset_create_fb(int fd, int fd_map, int *fd_dumb, struct modeset_dev *dev)
 {
 	struct drm_mode_create_dumb creq;
 	struct drm_mode_destroy_dumb dreq;
@@ -498,7 +499,7 @@ static int modeset_create_fb(int fd, int fd_map, struct modeset_dev *dev)
 			errno);
 		return -errno;
 	}
-	ret = xendrmmap_map(fd, fd_map, &creq);
+	ret = xendrmmap_map(fd, fd_map, fd_dumb, &creq);
 
 	dev->stride = creq.pitch;
 	dev->size = creq.size;
@@ -587,7 +588,7 @@ err_destroy:
 
 int main(int argc, char **argv)
 {
-	int ret, fd, fd_map;
+	int ret, fd, fd_map, fd_dumb;
 	const char *card;
 	struct modeset_dev *iter;
 
@@ -613,7 +614,7 @@ int main(int argc, char **argv)
 		goto out_return;
 
 	/* prepare all connectors and CRTCs */
-	ret = modeset_prepare(fd, fd_map);
+	ret = modeset_prepare(fd, fd_map, &fd_dumb);
 	if (ret)
 		goto out_close;
 
@@ -635,7 +636,7 @@ int main(int argc, char **argv)
 #endif
 
 	/* cleanup everything */
-	modeset_cleanup(fd, fd_map);
+	modeset_cleanup(fd, fd_map, fd_dumb);
 
 	ret = 0;
 
@@ -728,7 +729,7 @@ static void modeset_draw(void)
  * It should be pretty obvious how all of this works.
  */
 
-static void modeset_cleanup(int fd, int fd_map)
+static void modeset_cleanup(int fd, int fd_map, int fd_dumb)
 {
 	struct modeset_dev *iter;
 	struct drm_mode_destroy_dumb dreq;
@@ -759,7 +760,7 @@ static void modeset_cleanup(int fd, int fd_map)
 		memset(&dreq, 0, sizeof(dreq));
 		dreq.handle = iter->handle;
 
-		xendrmmap_unmap(fd_map);
+		xendrmmap_unmap(fd_map, fd_dumb);
 
 		drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
 
